@@ -34,11 +34,34 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from tools.binary_extensions import BINARY_EXTENSIONS
+import platform
+_IS_WINDOWS = platform.system() == "Windows"
 
 
-# ---------------------------------------------------------------------------
-# Write-path deny list — blocks writes to sensitive system/credential files
-# ---------------------------------------------------------------------------
+def _normalize_shell_path(path: str) -> str:
+    """Normalize a path that may contain mixed separators (Windows Git Bash quirk).
+
+    Git Bash can return paths like ``C:/Users/...\\file.txt`` — backslash sub-path
+    segments after a POSIX drive prefix.  This function converts such mixed paths to
+    OS-native separators so they can be reliably used by follow-up operations.
+
+    On Windows (nt) the native separator is ``\\``; elsewhere it is ``/``.
+    """
+    if not path:
+        return path
+    sep = os.sep
+    # Convert forward slashes and backslashes to the native separator.
+    # First swap any existing native separator to a placeholder, then swap all
+    # other separators to native, then restore the native separator.
+    swapped = path.replace(sep, "\x00").replace("/", sep).replace("\x00", sep)
+    return swapped
+
+
+class ReadResult:
+    """Result of a read operation."""
+    content: str
+    total_lines: int
+
 
 _HOME = str(Path.home())
 
@@ -972,7 +995,10 @@ class ShellFileOperations(FileOperations):
             result = self._exec(cmd_simple, timeout=60)
 
         files = []
-        for line in result.stdout.strip().split('\n'):
+        raw_lines = result.stdout.strip().split('\n')
+        if _IS_WINDOWS:
+            raw_lines = [_normalize_shell_path(l) for l in raw_lines]
+        for line in raw_lines:
             if not line:
                 continue
             parts = line.split(' ', 1)
@@ -1010,6 +1036,8 @@ class ShellFileOperations(FileOperations):
         )
         result = self._exec(cmd_sorted, timeout=60)
         all_files = [f for f in result.stdout.strip().split('\n') if f]
+        if _IS_WINDOWS:
+            all_files = [_normalize_shell_path(f) for f in all_files]
 
         if not all_files:
             # --sortr may have failed on older rg; retry without it.
@@ -1020,6 +1048,8 @@ class ShellFileOperations(FileOperations):
             )
             result = self._exec(cmd_plain, timeout=60)
             all_files = [f for f in result.stdout.strip().split('\n') if f]
+            if _IS_WINDOWS:
+                all_files = [_normalize_shell_path(f) for f in all_files]
 
         page = all_files[offset:offset + limit]
 

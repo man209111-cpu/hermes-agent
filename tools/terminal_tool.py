@@ -72,11 +72,35 @@ from tools.tool_backend_helpers import (
 )
 
 
+def _safe_parse_import_env(
+    name: str,
+    default: Any,
+    converter,
+    type_label: str,
+):
+    """Parse module-level numeric env vars without breaking import."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return converter(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid value for %s: %r (expected %s). Falling back to %r.",
+            name, raw, type_label, default,
+        )
+        return default
+
+
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
-FOREGROUND_MAX_TIMEOUT = int(os.getenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", "600"))
+FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer",
+)
 
 # Disk usage warning threshold (in GB)
-DISK_USAGE_WARNING_THRESHOLD_GB = float(os.getenv("TERMINAL_DISK_WARNING_GB", "500"))
+DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
+    "TERMINAL_DISK_WARNING_GB", 500.0, float, "number",
+)
 
 
 def _check_disk_usage_warning():
@@ -131,6 +155,12 @@ def set_approval_callback(cb):
     global _approval_callback
     _approval_callback = cb
 
+
+def _get_approval_callback():
+    """Return the current approval callback, or None if none set."""
+    return _approval_callback
+
+
 # =============================================================================
 # Dangerous Command Approval System
 # =============================================================================
@@ -144,7 +174,7 @@ from tools.approval import (
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_approval_callback)
+                                  approval_callback=_get_approval_callback())
 
 
 # Allowlist: characters that can legitimately appear in directory paths.

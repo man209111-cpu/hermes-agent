@@ -58,6 +58,7 @@ import re
 import signal
 import subprocess
 import shutil
+import shlex
 import sys
 import tempfile
 import threading
@@ -1178,6 +1179,17 @@ def _run_browser_command(
         "--json",
         command
     ] + args
+
+    # Windows/Python 3.15 sandbox quirk: launching npm/npx shims directly via
+    # subprocess.Popen(["npx", ...]) fails with WinError 2 / npm crypto startup
+    # errors, while the same command works through Git Bash. Keep the existing
+    # Unix/macOS path unchanged and only wrap the synthetic npx fallback on
+    # Windows.
+    if os.name == "nt" and browser_cmd == "npx agent-browser":
+        git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if git_bash.exists():
+            bash_cmd = " ".join(shlex.quote(str(part)) for part in cmd_parts)
+            cmd_parts = [str(git_bash), "-lc", bash_cmd]
     
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.

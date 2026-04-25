@@ -138,6 +138,19 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     return sanitized
 
 
+def _windows_to_posix_path(path: str) -> str:
+    """Convert a Windows path to a POSIX-style path usable by Git Bash.
+
+    C:\\Users\\... → /c/Users/...
+    The backslash-to-forward-slash conversion is necessary because bash -lc
+    interprets \\U and \\A as unicode escapes (Bash 5.x), mangling paths that
+    contain \\U (as in C:\\Users) or \\A (as in C:\\AppData).
+    """
+    if len(path) >= 2 and path[1] == ":":
+        return "/" + path[0].lower() + "/" + path[2:].replace("\\", "/")
+    return path
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
@@ -185,13 +198,15 @@ _find_shell = _find_bash
 
 # Standard PATH entries for environments with minimal PATH.
 if _IS_WINDOWS:
-    _SANE_PATH = ";".join([
+    _raw_paths = [
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin"),
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "usr", "bin"),
+        os.path.join(os.environ.get("USERPROFILE", r"C:\Users\Administrator"), ".cargo", "bin"),
         r"C:\Windows\System32",
         r"C:\Windows",
         r"C:\Windows\System32\Wbem",
-    ])
+    ]
+    _SANE_PATH = ";".join(_windows_to_posix_path(p) for p in _raw_paths)
 else:
     _SANE_PATH = (
         "/opt/homebrew/bin:/opt/homebrew/sbin:"
@@ -219,6 +234,15 @@ def _make_run_env(env: dict) -> dict:
     _usr_bin_check = "/usr/bin" if not _IS_WINDOWS else r"C:\Windows\System32"
     if _usr_bin_check not in existing_path.split(_path_sep):
         run_env["PATH"] = f"{existing_path}{_path_sep}{_SANE_PATH}" if existing_path else _SANE_PATH
+    else:
+        # Even when the original PATH is preserved, append _SANE_PATH so that
+        # tools installed in non-standard locations (e.g. ripgrep in .cargo\bin)
+        # are available inside the sandbox subprocess.
+        _sane_path_entries = [p for p in _SANE_PATH.split(_path_sep) if p]
+        _existing_entries = existing_path.split(_path_sep)
+        for _entry in _sane_path_entries:
+            if _entry not in _existing_entries:
+                run_env["PATH"] = f"{existing_path}{_path_sep}{_entry}"
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
@@ -229,6 +253,75 @@ def _make_run_env(env: dict) -> dict:
         run_env["HOME"] = _profile_home
 
     return run_env
+
+
+
+
+def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
+    """Read terminal.shell_init_files and auto_source_bashrc from config.yaml.
+
+    Returns ([], True) when the file is missing or the key is unreadable.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        terminal_cfg = cfg.get("terminal") or {}
+        files = terminal_cfg.get("shell_init_files") or []
+        if not isinstance(files, list):
+            files = []
+        auto_bashrc = bool(terminal_cfg.get("auto_source_bashrc", True))
+        return [str(f) for f in files if f], auto_bashrc
+    except Exception:
+        return [], True
+
+
+def _resolve_shell_init_files() -> list[str]:
+    """Resolve the list of files to source before the login-shell snapshot.
+
+    Expands ``~`` and ``${VAR}`` references and drops anything that doesn't
+    exist on disk, so a missing ``~/.bashrc`` never breaks the snapshot.
+    The ``auto_source_bashrc`` path runs only when the user hasn't supplied
+    an explicit list — once they have, Hermes trusts them.
+    """
+    explicit, auto_bashrc = _read_terminal_shell_init_config()
+
+    candidates: list[str] = []
+    if explicit:
+        candidates.extend(explicit)
+    elif auto_bashrc and not _IS_WINDOWS:
+        # Build a login-shell-ish source list so tools like n / nvm / asdf /
+        # pyenv that self-install into the user's shell rc land on PATH in
+        # the captured snapshot.
+        candidates.extend(["~/.profile", "~/.bash_profile", "~/.bashrc"])
+
+    resolved: list[str] = []
+    for raw in candidates:
+        try:
+            path = os.path.expandvars(os.path.expanduser(raw))
+        except Exception:
+            continue
+        if path and os.path.isfile(path):
+            resolved.append(path)
+    return resolved
+
+
+def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
+    """Prepend ``source <file>`` lines (guarded + silent) to a bash script.
+
+    Each file is wrapped so a failing rc file doesn't abort the whole
+    bootstrap: ``set +e`` keeps going on errors, ``2>/dev/null`` hides
+    noisy prompts, and ``|| true`` neutralises the exit status.
+    """
+    if not files:
+        return cmd_string
+
+    prelude_parts = ["set +e"]
+    for path in files:
+        safe = path.replace("'", "'\''")
+        prelude_parts.append(f"[ -r '{safe}' ] && . '{safe}' 2>/dev/null || true")
+    prelude = "\n".join(prelude_parts) + "\n"
+    return prelude + cmd_string
 
 
 class LocalEnvironment(BaseEnvironment):
@@ -259,7 +352,7 @@ class LocalEnvironment(BaseEnvironment):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate:
                 if _IS_WINDOWS and os.path.isdir(candidate):
-                    return candidate.rstrip("\\/")
+                    return _windows_to_posix_path(candidate.rstrip("\\/"))
                 if not _IS_WINDOWS and candidate.startswith("/"):
                     return candidate.rstrip("/") or "/"
 
@@ -268,7 +361,7 @@ class LocalEnvironment(BaseEnvironment):
 
         candidate = tempfile.gettempdir()
         if _IS_WINDOWS:
-            return candidate.rstrip("\\/")
+            return _windows_to_posix_path(candidate.rstrip("\\/"))
         if candidate.startswith("/"):
             return candidate.rstrip("/") or "/"
 
